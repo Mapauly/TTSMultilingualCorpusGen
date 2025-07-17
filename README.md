@@ -1,2 +1,1 @@
-# TTSMultilingualCorpusGen
-construct and optimize a multilingual speech parallel corpus generation system.
+pip install git+https://github.com/chameleon-ai/LangSegment-0.3.5-backup.git
