@@ -12,7 +12,8 @@ import jiwer
 import soundfile as sf
 import numpy as np
 from tqdm import tqdm
-
+import jieba
+from opencc import OpenCC
 # -------------------------------------------------------------------
 # 導入所有需要的函式庫
 # -------------------------------------------------------------------
@@ -44,14 +45,15 @@ class AIPipeline:
     一個封裝了所有 AI 模型（翻譯、TTS、ASR）的管線類別。
     模型只在伺服器啟動時載入一次。
     """
+
     def __init__(self):
-        print("="*50)
+        print("=" * 50)
         print("正在初始化 AI 管線，開始載入所有模型...")
-        print("="*50)
-        
+        print("=" * 50)
+
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
+        self.cc = OpenCC('t2s')
         # --- 1. 載入 NLLB 翻譯模型 ---
         self._load_translator_model()
 
@@ -60,7 +62,7 @@ class AIPipeline:
 
         # --- 3. 載入 Whisper ASR 模型 ---
         self._load_asr_model()
-        
+
         print("\n✅ 所有 AI 模型準備就緒！伺服器可以開始接收請求。")
 
     def _load_translator_model(self):
@@ -75,7 +77,7 @@ class AIPipeline:
         # 使用本地相對路徑來讀取設定檔
         cfg_path = "./models/tts/maskgct/config/maskgct.json"
         cfg = load_config(cfg_path)
-        
+
         # 💡 關鍵修改處：將 semantic_model 的設定傳入 build_semantic_model 函式
         # 這會讓它從本地 ckpt 載入，而不是從 transformers 下載
         # semantic_model, semantic_mean, semantic_std = build_semantic_model(
@@ -102,7 +104,7 @@ class AIPipeline:
         safetensors.torch.load_model(t2s_model, t2s_model_ckpt)
         safetensors.torch.load_model(s2a_model_1layer, s2a_1layer_ckpt)
         safetensors.torch.load_model(s2a_model_full, s2a_full_ckpt)
-        
+
         self.maskgct_pipeline = MaskGCT_Inference_Pipeline(
             semantic_model, semantic_codec, codec_encoder, codec_decoder, t2s_model,
             s2a_model_1layer, s2a_model_full, semantic_mean, semantic_std, self.device
@@ -117,7 +119,7 @@ class AIPipeline:
         )
         model.to(self.device)
         processor = AutoProcessor.from_pretrained(model_id)
-        
+
         self.whisper_pipe = pipeline(
             "automatic-speech-recognition",
             model=model,
@@ -147,13 +149,13 @@ class AIPipeline:
         返回 (音訊 NumPy 陣列, 採樣率)。
         """
         print(f"執行語音合成: {text[:20]}... (語言: {lang})")
-        
+
         # 關鍵修改：動態識別 prompt 音訊的內容，使其更穩健
         print(f"    正在識別音色樣本 '{os.path.basename(prompt_wav_path)}' 的內容...")
-        prompt_lang = "en" # 假設所有音色樣本都是英文
+        prompt_lang = "en"  # 假設所有音色樣本都是英文
         prompt_text = self.recognize(prompt_wav_path, prompt_lang)
         print(f"    識別出的音色樣本內容: '{prompt_text[:30]}...'")
-        
+
         with torch.cuda.amp.autocast():
             recovered_audio = self.maskgct_pipeline.maskgct_inference(
                 prompt_wav_path, prompt_text, text, prompt_lang, lang, target_len=None
@@ -162,44 +164,76 @@ class AIPipeline:
 
     def recognize(self, audio_path: str, lang: str) -> str:
         """
-        使用 Whisper 模型識別語音。
+        使用 Whisper 模型识别语音。
+        (最终版：在输出中文结果后，立即统一为简体)
         """
-        print(f"執行語音辨識: {audio_path} (語言: {lang})")
+        print(f"执行语音识别: {audio_path} (语言: {lang})")
+
+        # 调用 Whisper 模型
         result = self.whisper_pipe(
             audio_path,
             generate_kwargs={"language": lang, "task": "transcribe"}
         )
-        # 確保返回的文本是乾淨的字串
-        return result.get("text", "").strip()
-    
-# 在 backend/ai_pipeline.py 文件中，找到并替换这个函数
+        recognized_text = result.get("text", "").strip()
 
-    def evaluate(self, reference_text: str, hypothesis_text: str) -> dict:
+        # 核心逻辑：如果是中文，立即进行简繁统一
+        if lang == 'chinese':
+            print("      检测到中文识别结果，执行简繁统一...")
+            try:
+                simplified_text = self.cc.convert(recognized_text)
+                return simplified_text
+            except Exception as e:
+                print(f"      [警告] OpenCC 简繁转换失败: {e}")
+                # 即使转换失败，也返回原始识别结果
+                return recognized_text
+
+        # 如果不是中文，直接返回原始识别结果
+        return recognized_text
+
+    # 在 backend/ai_pipeline.py 文件中，找到并替换这个函数
+
+    def evaluate(self, reference_text: str, hypothesis_text: str, lang_code: str) -> dict:
         """
-        使用 Jiwer 计算 WER 和 CER。(已修改为兼容最旧版的 API)
+        使用 Jiwer 计算 WER 和 CER。
+        (最终版：采用标准范式处理中文分词，以解决 jiwer 的解析错误)
         """
-        print("执行评估 (使用最兼容的 Jiwer API)...")
-        
-        # 1. 定义文本转换的规则
+        print(f"执行评估 (语言: {lang_code})...")
+
+        # 1. 定义通用的文本标准化规则
         transformation = jiwer.Compose([
             jiwer.ToLowerCase(),
             jiwer.RemoveMultipleSpaces(),
             jiwer.Strip(),
             jiwer.RemovePunctuation(),
         ])
-        
-        # 2. 在调用 jiwer 之前，手动对两个字符串应用转换规则
+
+        # 2. 对两个字符串应用标准化规则
         processed_reference = transformation(reference_text)
         processed_hypothesis = transformation(hypothesis_text)
-        
-        # 3. 调用 jiwer 最基础的功能，只传入两个处理好的字符串
-        wer_score = jiwer.wer(processed_reference, processed_hypothesis)
+
+        # 3. 智能计算 WER (最终修正版)
+        if lang_code == 'zh':
+            print("      检测到中文，使用 jieba 分词并用空格连接...")
+            # 对于中文，先用 jieba 分词，然后用空格将词语连接成一个标准字符串
+            ref_words = " ".join(jieba.lcut(processed_reference))
+            hyp_words = " ".join(jieba.lcut(processed_hypothesis))
+
+            # 将两个处理好的、空格分隔的字符串交给 jiwer
+            wer_score = jiwer.wer(ref_words, hyp_words)
+        else:
+            # 对于其他语言，直接使用 jiwer 默认的空格分词
+            wer_score = jiwer.wer(processed_reference, processed_hypothesis)
+
+        # 4. CER 是基于字符的，不受分词影响，可以直接计算
+        # 我们仍然使用处理过的字符串，以确保公平性 (移除了标点和多余空格)
         cer_score = jiwer.cer(processed_reference, processed_hypothesis)
 
         return {
             "wer": wer_score,
             "cer": cer_score,
         }
+
+
 # --- 全局實例 ---
 # 在應用程式啟動時，只建立一次 AIPipeline 的實例。
 # FastAPI 主程式 (main.py) 將會導入並使用這個物件。

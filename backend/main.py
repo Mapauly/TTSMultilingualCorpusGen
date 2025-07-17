@@ -22,7 +22,6 @@ os.environ['TRANSFORMERS_CACHE'] = os.path.join(HF_CACHE_DIR, 'hub')
 print("正在設定 Hugging Face 鏡像站以加速下載...")
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
-
 # 現在可以安全地導入我們的 AI 管線了，它內部會導入 transformers
 from fastapi import FastAPI, HTTPException
 # 💡 主要修改處：導入 FileResponse 用於返回 HTML 檔案
@@ -37,13 +36,13 @@ import logging
 # 伺服器啟動時，ai_pipeline.py 會被執行，所有模型會被載入
 try:
     # 前面的點 . 代表「從當前所在的資料夾(也就是 backend)導入」
-    from ai_pipeline import ai_pipeline 
+    from ai_pipeline import ai_pipeline
 except ImportError as e:
-    print("="*80)
+    print("=" * 80)
     print("錯誤：無法導入 ai_pipeline。")
     print("請確保您已遵循專案結構，並且 ai_pipeline.py 能夠正確找到 Amphion 的路徑。")
     print(f"詳細錯誤: {e}")
-    print("="*80)
+    print("=" * 80)
     exit()
 
 # --- 1. 初始化 FastAPI 應用 ---
@@ -53,11 +52,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
+
 # --- 2. 定義資料模型 (用於驗證 API 請求的內容) ---
 class ProcessRequest(BaseModel):
     text: str
     target_language: str
     prompt_wav_path: str
+
 
 # --- 3. 靜態檔案與路徑設定 ---
 # 這個路徑是相對於 main.py 所在的 backend/ 資料夾
@@ -76,17 +77,17 @@ app.mount("/generated_audio", StaticFiles(directory=AUDIO_OUTPUT_DIR), name="gen
 # 將 prompts 資料夾也掛載，以便前端可以預覽音色（如果需要）
 app.mount("/prompts", StaticFiles(directory=PROMPTS_DIR), name="prompts")
 
-
 # --- 4. 語言代碼映射 ---
 # 將前端傳來的簡單代碼，轉換為各個模型需要的特定代碼
 NLLB_LANG_MAP = {
-    "zh": "zho_Hant", "ja": "jpn_Jpan", "ko": "kor_Hang",
+    "zh": "zho_Hans", "ja": "jpn_Jpan", "ko": "kor_Hang",
     "de": "deu_Latn", "fr": "fra_Latn"
 }
 WHISPER_LANG_MAP = {
     "zh": "chinese", "ja": "japanese", "ko": "korean",
     "de": "german", "fr": "french"
 }
+
 
 # --- 5. API 端點 (Endpoints) ---
 
@@ -95,6 +96,7 @@ WHISPER_LANG_MAP = {
 def read_root():
     """根目錄，直接提供前端網頁"""
     return os.path.join(STATIC_FILES_DIR, 'index.html')
+
 
 @app.get("/prompts", response_model=list[str])
 def get_prompts():
@@ -116,19 +118,20 @@ async def process_full_pipeline(request: ProcessRequest):
         nllb_lang = NLLB_LANG_MAP.get(request.target_language)
         if not nllb_lang:
             raise HTTPException(status_code=400, detail=f"不支援的目標語言: {request.target_language}")
-        
+
         translated_text = ai_pipeline.translate(request.text, nllb_lang)
 
         # --- 步驟 2: 語音合成 (TTS) ---
         # 將前端傳來的 URL 路徑轉換為伺服器上的絕對路徑
-        prompt_absolute_path = os.path.join(os.path.dirname(__file__), '..', 'models_and_data', request.prompt_wav_path.lstrip('/'))
+        prompt_absolute_path = os.path.join(os.path.dirname(__file__), '..', 'models_and_data',
+                                            request.prompt_wav_path.lstrip('/'))
         if not os.path.exists(prompt_absolute_path):
-             raise HTTPException(status_code=404, detail=f"找不到音色檔案: {prompt_absolute_path}")
+            raise HTTPException(status_code=404, detail=f"找不到音色檔案: {prompt_absolute_path}")
 
         audio_data, samplerate = ai_pipeline.synthesize(
             translated_text, request.target_language, prompt_absolute_path
         )
-        
+
         # 儲存生成的音訊檔案
         filename = f"{uuid.uuid4()}.wav"
         save_path = os.path.join(AUDIO_OUTPUT_DIR, filename)
@@ -141,7 +144,9 @@ async def process_full_pipeline(request: ProcessRequest):
         transcribed_text = ai_pipeline.recognize(save_path, whisper_lang)
 
         # --- 步驟 4: 評估 (WER/CER) ---
-        evaluation_results = ai_pipeline.evaluate(translated_text, transcribed_text)
+        # evaluation_results = ai_pipeline.evaluate(translated_text, transcribed_text)
+        # 将 request.target_language 作为新参数传递进去
+        evaluation_results = ai_pipeline.evaluate(translated_text, transcribed_text, request.target_language)
 
         # --- 步驟 5: 返回完整結果 ---
         return {
